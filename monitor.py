@@ -1,110 +1,56 @@
 """
 Doomsday Watch - checks cinema.mv for Avengers: Doomsday ticket sales
-and sends an email when tickets look available.
+and sends an email when tickets are available.
+
+How it decides (based on how cinema.mv is built):
+  * The film's own page (MOVIE_URL) says "There are no screenings of this
+    show available" while it's coming soon. Once sales open it lists
+    showtimes with "seats available".
+  * As a backup it also checks the homepage: the film moving into the
+    "Now Showing" row, or its banner showing "Book tickets".
 
 Environment variables:
   GMAIL_USER          Gmail address that sends the alert (required to email)
   GMAIL_APP_PASSWORD  16-character Gmail App Password (required to email)
   NOTIFY_TO           Where to send the alert (defaults to GMAIL_USER)
-  CINEMA_URL          Page to check (default https://cinema.mv)
-  MOVIE_KEYWORD       Text to look for (default "doomsday")
-  ALERT_ON_ANY        "1" = alert as soon as the film appears anywhere,
-                      even under "Coming soon" (default "0")
+  MOVIE_URL           Film page (default https://cinema.mv/movie/avengers-doomsday)
+  HOME_URL            Homepage (default https://cinema.mv/)
+  MOVIE_KEYWORD       Text that identifies the film (default "doomsday")
   TEST_EMAIL          "1" = just send a test email and exit
 
-Exit code 0 always (so GitHub doesn't spam you with failure emails).
+Always exits 0 so GitHub doesn't spam you with failure emails.
 Writes found=true/false to $GITHUB_OUTPUT when running in GitHub Actions.
 """
 
 import os
+import re
 import smtplib
 import ssl
-import sys
 from email.message import EmailMessage
 
 from playwright.sync_api import sync_playwright
 
-URL = os.environ.get("CINEMA_URL", "https://cinema.mv")
+MOVIE_URL = os.environ.get("MOVIE_URL", "https://cinema.mv/movie/avengers-doomsday")
+HOME_URL = os.environ.get("HOME_URL", "https://cinema.mv/")
 KEYWORD = os.environ.get("MOVIE_KEYWORD", "doomsday").lower()
-ALERT_ON_ANY = os.environ.get("ALERT_ON_ANY", "0") == "1"
 
-# Runs inside the page. Finds every element mentioning the keyword, then
-# looks at its surrounding "movie card" for booking buttons or showtimes,
-# and checks whether it sits under a "Coming soon" heading.
-FIND_JS = r"""
+NO_SCREENINGS = re.compile(r"no\s+screenings", re.I)
+SHOWTIME_SIGNS = re.compile(r"seats?\s+available|showtimes\s*-|book\s+at\s+counter|\b([01]\d|2[0-3]):[0-5]\d\b", re.I)
+BLOCK_SIGNS = re.compile(r"just a moment|attention required|verify you are human|access denied|cf-chl", re.I)
+
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/131.0 Safari/537.36")
+
+HOME_JS = r"""
 (kw) => {
-  const BOOK = /\b(book|buy|get)\s*(now|tickets?|seats?)?\b|\btickets?\b|\bshow\s*times?\b|\breserve\b/i;
-  const TIME = /\b([01]?\d|2[0-3])[:.][0-5]\d\s*(am|pm)?\b/i;
-  const SOON = /coming\s*soon|upcoming|releasing\s*soon|next\s*release/i;
-
-  const mentions = (el) => {
-    const own = [...el.childNodes].filter(n => n.nodeType === 3).map(n => n.textContent).join(' ');
-    const attrs = ['alt', 'title', 'aria-label', 'href', 'src', 'data-title', 'data-name']
-      .map(a => el.getAttribute && el.getAttribute(a) || '').join(' ');
-    return (own + ' ' + attrs).toLowerCase().includes(kw);
-  };
-
-  const underSoon = (el) => {
-    // Walk up the page; the nearest section label (id/class or heading) wins.
-    let node = el;
-    for (let depth = 0; node && depth < 12; depth++, node = node.parentElement) {
-      const label = ((node.id || '') + ' ' + (typeof node.className === 'string' ? node.className : '') + ' ' +
-                     ((node.getAttribute && node.getAttribute('aria-label')) || '')).replace(/[-_]/g, ' ');
-      if (SOON.test(label)) return true;
-      if (/now\s*showing|in\s*cinemas|showing\s*now/i.test(label)) return false;
-      let sib = node.previousElementSibling;
-      for (let i = 0; sib && i < 30; i++, sib = sib.previousElementSibling) {
-        if (/^(NAV|HEADER|UL|OL|SCRIPT|STYLE)$/.test(sib.tagName) || sib.querySelector('nav, a[href]')) continue;
-        const t = (sib.innerText || '').trim();
-        if (/^H[1-6]$/.test(sib.tagName) || (t.length > 0 && t.length < 40)) {
-          if (SOON.test(t)) return true;
-          if (/now\s*showing|in\s*cinemas|showing\s*now/i.test(t)) return false;
-        }
-      }
-    }
-    return false;
-  };
-
-  const hits = [...document.querySelectorAll('*')].filter(mentions);
-  return hits.slice(0, 20).map(el => {
-    // Grow to the enclosing card (stop before it gets page-sized)
-    const SECTION = /coming\s*soon|now\s*showing|upcoming|in\s*cinemas/i;
-    const count = (n) => n.querySelectorAll('h1,h2,h3,h4,h5,h6,img').length + (/^(H[1-6]|IMG)$/.test(n.tagName) ? 1 : 0);
-    let card = el;
-    for (let i = 0; i < 6 && card.parentElement; i++) {
-      const p = card.parentElement;
-      const pt = p.innerText || '', ct = card.innerText || '';
-      if (pt.length > 1500) break;
-      if (SECTION.test(pt) && !SECTION.test(ct)) break;      // would swallow a section label
-      if (count(p) > Math.max(2, count(card) + 1)) break;    // would swallow another film
-      card = p;
-    }
-    const text = (card.innerText || '').replace(/\s+/g, ' ').trim();
-    const clickables = [...card.querySelectorAll('a, button, [role=button]')];
-    const hasBook = clickables.some(c => BOOK.test((c.innerText || '') + ' ' + (c.getAttribute('aria-label') || '')));
-    const links = [...new Set(clickables.map(c => c.href).filter(Boolean))];
-    if (el.href) links.unshift(el.href);
-    return {
-      text: text.slice(0, 300),
-      hasBook,
-      hasTime: TIME.test(text),
-      soon: underSoon(el),
-      links: links.slice(0, 5),
-    };
-  });
-}
-"""
-
-PAGE_HAS_BOOKING_JS = r"""
-() => {
-  const BOOK = /\b(book|buy|get)\s*(now|tickets?|seats?)\b|\bselect\s*seats?\b|\bbuy\b/i;
-  const TIME = /\b([01]?\d|2[0-3])[:.][0-5]\d\s*(am|pm)?\b/i;
-  const clickables = [...document.querySelectorAll('a, button, [role=button]')];
-  const book = clickables.some(c => BOOK.test(c.innerText || ''));
-  const times = clickables.filter(c => TIME.test(c.innerText || '')).length;
-  const h = [...document.querySelectorAll('h1,h2,h3')].map(x => x.innerText).join(' ');
-  const soon = /coming\s*soon/i.test(h) && times === 0;
-  return { book, times, soon };
+  const has = (el) => (el.innerText || '').toLowerCase().includes(kw)
+                   || [...el.querySelectorAll('img')].some(i => (i.alt || '').toLowerCase().includes(kw));
+  const nowRow = document.querySelector('#now-showing');
+  const inNowShowing = !!nowRow && [...nowRow.querySelectorAll('a, .poster-card')].some(has);
+  const slide = [...document.querySelectorAll('.banner-slide')].find(has);
+  const bannerBook = !!slide && /book\s*tickets?|showtimes/i.test(slide.innerText || '');
+  const bannerLabel = slide ? ((slide.querySelector('.banner-label') || {}).innerText || '') : '';
+  return { inNowShowing, bannerBook, bannerLabel, found: !!slide || [...document.querySelectorAll('a')].some(has) };
 }
 """
 
@@ -135,63 +81,58 @@ def set_output(found: bool) -> None:
             f.write(f"found={'true' if found else 'false'}\n")
 
 
+def load(page, url: str) -> str:
+    """Open a page, wait for real content, return its visible text."""
+    resp = page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+    status = resp.status if resp else "?"
+    # Give Cloudflare challenges / late scripts up to ~20s to clear
+    text = ""
+    for _ in range(10):
+        page.wait_for_timeout(2000)
+        text = page.inner_text("body") if page.query_selector("body") else ""
+        if KEYWORD in text.lower() or NO_SCREENINGS.search(text):
+            break
+    snippet = re.sub(r"\s+", " ", text)[:200]
+    print(f"  {url} -> HTTP {status}, title={page.title()!r}")
+    print(f"    text: {snippet}")
+    if BLOCK_SIGNS.search(page.title() + " " + text[:500]):
+        print("    !! looks like the site served a bot check / block page")
+    return text
+
+
 def check() -> tuple[bool, str]:
-    """Returns (tickets_on_sale, explanation)."""
     with sync_playwright() as p:
-        browser = p.chromium.launch()
-        page = browser.new_page(user_agent=(
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/130.0 Safari/537.36"))
-        page.goto(URL, wait_until="networkidle", timeout=60_000)
-        page.wait_for_timeout(3000)  # let JS-rendered listings settle
+        browser = p.chromium.launch(args=["--disable-blink-features=AutomationControlled"])
+        ctx = browser.new_context(user_agent=UA, locale="en-US", viewport={"width": 1366, "height": 900})
+        page = ctx.new_page()
 
-        hits = page.evaluate(FIND_JS, KEYWORD)
-        if not hits:
+        # 1) The film's own page
+        movie = load(page, MOVIE_URL)
+        movie_ok = KEYWORD in movie.lower()
+        if movie_ok and SHOWTIME_SIGNS.search(movie) and not NO_SCREENINGS.search(movie):
             browser.close()
-            return False, f"'{KEYWORD}' not found on {URL}"
+            return True, f"Showtimes are listed on the film page:\n{MOVIE_URL}"
 
-        for h in hits:
-            print(f"  match: soon={h['soon']} book={h['hasBook']} time={h['hasTime']} :: {h['text'][:120]}")
-
-        if ALERT_ON_ANY:
-            browser.close()
-            return True, f"'{KEYWORD}' now appears on {URL}:\n\n{hits[0]['text']}"
-
-        # 1) Card on the homepage itself shows a booking button / showtimes
-        for h in hits:
-            if not h["soon"] and (h["hasBook"] or h["hasTime"]):
-                browser.close()
-                return True, f"Booking appears open on {URL}:\n\n{h['text']}"
-
-        # 2) Follow the film's own page and look for booking there
-        tried = set()
-        for h in hits:
-            for link in h["links"]:
-                if link.split("#")[0] == page.url.split("#")[0] or link in tried or not link.startswith("http"):
-                    continue
-                tried.add(link)
-                if len(tried) > 4:
-                    break
-                try:
-                    page.goto(link, wait_until="networkidle", timeout=45_000)
-                    page.wait_for_timeout(2000)
-                    r = page.evaluate(PAGE_HAS_BOOKING_JS)
-                    print(f"  film page {link}: {r}")
-                    if (r["book"] or r["times"] >= 1) and not r["soon"]:
-                        browser.close()
-                        return True, f"Booking appears open on the film page:\n{link}"
-                except Exception as e:  # noqa: BLE001
-                    print(f"  could not open {link}: {e}")
-
+        # 2) Backup: the homepage
+        load(page, HOME_URL)
+        r = page.evaluate(HOME_JS, KEYWORD)
+        print(f"  homepage: {r}")
         browser.close()
-        where = "listed as coming soon" if any(h["soon"] for h in hits) else "listed, but no booking yet"
-        return False, f"'{KEYWORD}' is {where}"
+
+        if r["inNowShowing"] or r["bannerBook"]:
+            return True, f"Avengers: Doomsday is now under Now Showing / has a Book tickets button on {HOME_URL}"
+
+        if not movie_ok and not r["found"]:
+            return False, "could not see the film on either page (site may be blocking the checker - see log above)"
+        if NO_SCREENINGS.search(movie):
+            return False, f"film page says no screenings yet ({r.get('bannerLabel') or 'coming soon'})"
+        return False, "film is listed but no showtimes yet"
 
 
 def main() -> None:
     if os.environ.get("TEST_EMAIL") == "1":
         send_email("Doomsday Watch: test email",
-                   f"This is a test. The checker is set up and watching {URL}.")
+                   f"This is a test. The checker is set up and watching {MOVIE_URL}.")
         set_output(False)
         return
 
@@ -205,9 +146,9 @@ def main() -> None:
     print(("TICKETS ON SALE: " if found else "Not yet: ") + why)
     if found:
         send_email("🎬 Avengers: Doomsday tickets are on sale at cinema.mv!",
-                   f"{why}\n\nGo book: {URL}\n\n(The checker has now switched itself off.)")
+                   f"{why}\n\nGo book: {MOVIE_URL}\n\n(The checker has now switched itself off.)")
     set_output(found)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
