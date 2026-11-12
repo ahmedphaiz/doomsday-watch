@@ -1,0 +1,54 @@
+name: Doomsday Watch
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"   # every 5 minutes (GitHub may delay runs a few minutes when busy)
+  workflow_dispatch:
+    inputs:
+      test_email:
+        description: "Send a test email instead of checking"
+        type: boolean
+        default: false
+
+permissions:
+  actions: write   # lets the job switch itself off after the alert
+  contents: read
+
+concurrency:
+  group: doomsday-watch
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install Playwright
+        run: |
+          pip install playwright==1.48.0
+          python -m playwright install --with-deps chromium
+
+      - name: Check cinema.mv
+        id: check
+        env:
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          NOTIFY_TO: ${{ secrets.NOTIFY_TO }}
+          CINEMA_URL: https://cinema.mv
+          MOVIE_KEYWORD: doomsday
+          ALERT_ON_ANY: "0"
+          TEST_EMAIL: ${{ inputs.test_email && '1' || '0' }}
+        run: python monitor.py
+
+      - name: Stop checking once tickets are found
+        if: steps.check.outputs.found == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow disable "Doomsday Watch" --repo "${{ github.repository }}"
